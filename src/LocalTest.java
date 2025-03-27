@@ -106,7 +106,7 @@ class LocalTest {
 	    // Read them back to make sure the other node handled them correctly
 	    for (int i = 0; i < lines.size(); ++i) {
 		String key = "D:Juliet-" + i;
-		System.out.print("Trying to write " + key);
+		System.out.print("Trying to read " + key);
 		String value = nodes[0].read(key);
 		if (value == null) {
 		    System.out.println(" not found?");
