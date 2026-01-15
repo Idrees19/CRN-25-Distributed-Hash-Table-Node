@@ -1,15 +1,10 @@
-// IN2011 Computer Networks
-// Coursework 2024/2025
-//
-// Submission by
-//  YOUR_NAME_GOES_HERE
-//  YOUR_STUDENT_ID_NUMBER_GOES_HERE
-//  YOUR_EMAIL_GOES_HERE
-
 import java.net.*;
 import java.util.*;
 import java.io.*;
-import java.security.*;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+
 
 // DO NOT EDIT starts
 // This gives the interface that your code must implement.
@@ -21,7 +16,7 @@ interface NodeInterface {
     /* These methods configure your node.
      * They must both be called once after the node has been created but
      * before it is used. */
-    
+
     // Set the name of the node.
     public void setNodeName(String nodeName) throws Exception;
 
@@ -38,7 +33,7 @@ interface NodeInterface {
     // there are no new incoming messages return.
     // If delay is zero then wait for an unlimited amount of time.
     public void handleIncomingMessages(int delay) throws Exception;
-    
+
     // Determines if a node can be contacted and is responding correctly.
     // Handles any messages that have arrived.
     public boolean isActive(String nodeName) throws Exception;
@@ -46,14 +41,14 @@ interface NodeInterface {
     // You need to keep a stack of nodes that are used to relay messages.
     // The base of the stack is the first node to be used as a relay.
     // The first node must relay to the second node and so on.
-    
+
     // Adds a node name to a stack of nodes used to relay all future messages.
     public void pushRelay(String nodeName) throws Exception;
 
     // Pops the top entry from the stack of nodes used for relaying.
     // No effect if the stack is empty
     public void popRelay() throws Exception;
-    
+
 
     /*
      * These methods provide access to the basic functionality of
@@ -63,7 +58,7 @@ interface NodeInterface {
     // Checks if there is an entry in the network with the given key.
     // Handles any messages that have arrived.
     public boolean exists(String key) throws Exception;
-    
+
     // Reads the entry stored in the network for key.
     // If there is a value, return it.
     // If there isn't a value, return null.
@@ -84,136 +79,362 @@ interface NodeInterface {
 // DO NOT EDIT ends
 
 // Complete this!
-
 public class Node implements NodeInterface {
-    private String myNodeName;
-    private byte[] myNodeHashID;
+
+    private String nodeName;
     private DatagramSocket socket;
-    private boolean socketOpen = false;
+    private final Map<String, String> kvStore;
+    private final Map<Integer,List<String>> addressByDistance;
+    private Deque<String> relayStack;
 
-    private Map<String, String> addressMap = new HashMap<>();
-    private Map<Integer, List<String>> distanceBuckets = new HashMap<>();
-
-    private Map<String, String> dataMap = new HashMap<>();
-
-    private Deque<String> relayStack = new ArrayDeque<>();
-
-    private final Object responseLock = new Object();
-    private Map<String, String> responseMap = new HashMap<>();
-    private Random random = new Random();
+    public Node() {
+        this.kvStore = new HashMap<>();
+        this.addressByDistance = new HashMap<>();
+        this.relayStack = new ArrayDeque<>();
+    }
 
     @Override
     public void setNodeName(String nodeName) throws Exception {
-        if (!nodeName.startsWith("N:")) {
-            throw new Exception("Node name must start with 'N:' according to the RFC.");
+        if (nodeName == null || !nodeName.startsWith("N:")) {
+            throw new IllegalArgumentException("Node name must start with 'N:'");
         }
-        this.myNodeName = nodeName;
-        this.myNodeHashID = sha256(nodeName);
+        this.nodeName = nodeName;
     }
 
     @Override
     public void openPort(int portNumber) throws Exception {
-        if (myNodeName == null) {
-            throw new Exception("Must call setNodeName before openPort!");
+        if (portNumber < 20110 || portNumber > 20130) {
+            throw new IllegalArgumentException("Port number out of range (20110-20130)");
         }
-        this.socket = new DatagramSocket(portNumber);
-        this.socket.setSoTimeout(0);
-        this.socketOpen = true;
+        socket = new DatagramSocket(portNumber);
+        String ip   = socket.getLocalAddress().getHostAddress();
+        int    port = socket.getLocalPort();
+        maybeStoreAddress(nodeName, ip + ":" + port);
+
+        socket.setSoTimeout(200);
     }
 
-   /**
-     * Listen for incoming messages on our socket. If delay > 0, we wait up to
-     * 'delay' ms total. If delay == 0, we wait forever, or until an exception.
-     */
     @Override
     public void handleIncomingMessages(int delay) throws Exception {
-        if (!socketOpen) {
-            throw new Exception("Socket not opened!");
-        }
-        long startTime = System.currentTimeMillis();
+        long endTime = (delay == 0) ? Long.MAX_VALUE : (System.currentTimeMillis() + delay);
 
-        while (true) {
-            long elapsed = System.currentTimeMillis() - startTime;
-            if ((delay > 0) && (elapsed >= delay)) {
-                return;
-            }
-
-            int timeLeft = 0;
-            if (delay > 0) {
-                long left = delay - elapsed;
-                timeLeft = (left > 0) ? (int) left : 1;
-            }
-
+        while (System.currentTimeMillis() < endTime) {
             try {
-                socket.setSoTimeout(timeLeft == 0 ? 0 : timeLeft);
-                byte[] buf = new byte[2048];
+                byte[] buf = new byte[1500];
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 socket.receive(packet);
-
-                String msg = new String(packet.getData(), 0, packet.getLength(), "UTF-8");
-                InetAddress senderAddr = packet.getAddress();
-                int senderPort = packet.getPort();
-
-                processIncomingMessage(msg, senderAddr, senderPort);
-
-            } catch (SocketTimeoutException e) {
-                return;
+                processIncomingPacket(packet);
+            } catch (SocketTimeoutException ste) {
+                // no packet arrived in the last 200ms
             } catch (IOException ioe) {
-                return;
+                ioe.printStackTrace();
             }
         }
     }
 
-    /**
-     * isActive: We check if a node can be contacted and is responding.
-     * We'll do this by sending it a "name request" (G) and waiting for
-     * a correct "name response" (H).
-     */
-    @Override
-    public boolean isActive(String nodeName) throws Exception {
-        String address = addressMap.get(nodeName);
-        if (address == null) {
-            return false;
+    private void processIncomingPacket(DatagramPacket packet) throws IOException {
+        String received = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
+        if (received.length() < 4) {
+            return;
         }
 
-        String[] parts = address.split(":");
-        if (parts.length != 2) return false;
-        InetAddress ip = InetAddress.getByName(parts[0]);
-        int port = Integer.parseInt(parts[1]);
+        String transactionID = received.substring(0, 2);
+        if (received.charAt(2) != ' ') {
+            return;
+        }
+        char msgType = received.charAt(3);
 
-        String tid = generateTID();
-        String message = tid + " G";
+        String payload = "";
+        if (received.length() > 5) {
+            payload = received.substring(5);
+        }
 
-        for (int attempt = 0; attempt < 3; attempt++) {
-            sendMessage(ip, port, wrapWithRelay(tid, nodeName, message));
+        switch (msgType) {
+            case 'W':
+                handleWriteRequest(transactionID, payload, packet);
+                break;
+            case 'R':
+                handleReadRequest(transactionID, payload, packet);
+                break;
+            case 'E':
+                handleExistsRequest(transactionID, payload, packet);
+                break;
+            case 'C':
+                handleCasRequest(transactionID, payload, packet);
+                break;
+            case 'G':
+                handleNameRequest(transactionID, packet);
+                break;
+            case 'N':
+                handleNearestRequest(transactionID, payload, packet);
+                break;
+            case 'V':
+                handleRelayRequest(transactionID, payload, packet);
+                break;
+            case 'I':
+                break;
+            default:
+                break;
+        }
+    }
 
-            long waitStart = System.currentTimeMillis();
-            while (System.currentTimeMillis() - waitStart < 1000) {
-                handleIncomingMessages(100);
-                String response = null;
-                synchronized(responseLock) {
-                    response = responseMap.remove(tid);
-                }
-                if (response != null) {
-                    if (response.startsWith("H ")) {
-                        String theirName = response.substring(2).trim();
-                        return (theirName.equals(nodeName));
-                    }
+    private boolean conditionA(String key) {
+        return kvStore.containsKey(key);
+    }
+
+    private boolean conditionB(String key) {
+        String myHash = computeHash(this.nodeName);
+        String keyHash= computeHash(key);
+        int myDistance= distance(myHash, keyHash);
+
+        int countStrictlyCloser = 0;
+        for (String k : kvStore.keySet()) {
+            if (!k.startsWith("N:")) continue;
+            String nodeHash = computeHash(k);
+            int d = distance(nodeHash, keyHash);
+            if (d < myDistance) {
+                countStrictlyCloser++;
+                if (countStrictlyCloser >= 3) {
                     return false;
                 }
             }
         }
-        return false;
+        return true;
     }
 
-    /**
-     * Future messages will be relayed first to nodeName on top of stack
-     * (lowest in the Deque). We push to the top of the Deque so that
-     * it is used *last* in the chain or first? The assignment isn't
-     * 100% explicit. We'll treat the base as the front of the queue.
-     */
+    private void maybeStoreAddress(String nodeKey, String nodeAddr) {
+        String myHash = computeHash(this.nodeName);
+        String nodeHash = computeHash(nodeKey);
+        int dist = distance(myHash, nodeHash);
+
+        List<String> list = addressByDistance.get(dist);
+        if (list == null) {
+            list = new ArrayList<>();
+            addressByDistance.put(dist, list);
+        }
+        if (list.size() < 3) {
+            list.add(nodeKey);
+            kvStore.put(nodeKey, nodeAddr);
+        }
+        else {
+        }
+    }
+
+    private void handleWriteRequest(String txID, String payload, DatagramPacket packet) throws IOException {
+        try {
+            ParseResult pr1 = extractStringWithOffset(payload, 0);
+            String key = pr1.value;
+            ParseResult pr2 = extractStringWithOffset(payload, pr1.nextOffset);
+            String value = pr2.value;
+
+            boolean A = conditionA(key);
+            boolean B = conditionB(key);
+
+            char responseChar;
+            if (A) {
+                kvStore.put(key, value);
+                responseChar = 'R';
+            } else {
+                if (B) {
+                    if (key.startsWith("N:")) {
+                        maybeStoreAddress(key, value);
+                    } else {
+                        kvStore.put(key, value);
+                    }
+                    responseChar = 'A';
+                } else {
+                    responseChar = 'X';
+                }
+            }
+            String response = txID + " X " + responseChar;
+            sendResponse(packet, response);
+
+        } catch (IllegalArgumentException e) {
+            sendResponse(packet, txID + " X X");
+        }
+    }
+
+    private void handleReadRequest(String txID, String payload, DatagramPacket packet) throws IOException {
+        try {
+            ParseResult pr = extractStringWithOffset(payload, 0);
+            String key = pr.value;
+
+            boolean A = conditionA(key);
+            boolean B = conditionB(key);
+
+            if (A) {
+                String val = kvStore.get(key);
+                String encodedVal = encodeString(val);
+                String resp = txID + " S Y " + encodedVal;
+                sendResponse(packet, resp);
+            } else {
+                if (B) {
+                    String resp = txID + " S N ";
+                    sendResponse(packet, resp);
+                } else {
+                    String resp = txID + " S ? ";
+                    sendResponse(packet, resp);
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            sendResponse(packet, txID + " S ? ");
+        }
+    }
+
+    private void handleExistsRequest(String txID, String payload, DatagramPacket packet) throws IOException {
+        try {
+            ParseResult pr = extractStringWithOffset(payload, 0);
+            String key = pr.value;
+
+            boolean A = conditionA(key);
+            boolean B = conditionB(key);
+
+            char rc;
+            if (A) {
+                rc = 'Y';
+            } else {
+                if (B) rc = 'N';
+                else   rc = '?';
+            }
+            String resp = txID + " F " + rc;
+            sendResponse(packet, resp);
+
+        } catch (IllegalArgumentException e) {
+            sendResponse(packet, txID + " F ?");
+        }
+    }
+
+    private void handleCasRequest(String txID, String payload, DatagramPacket packet) throws IOException {
+        try {
+            ParseResult pr1 = extractStringWithOffset(payload, 0);
+            String key = pr1.value;
+            ParseResult pr2 = extractStringWithOffset(payload, pr1.nextOffset);
+            String requestedValue = pr2.value;
+            ParseResult pr3 = extractStringWithOffset(payload, pr2.nextOffset);
+            String newValue = pr3.value;
+
+            boolean A = conditionA(key);
+            boolean B = conditionB(key);
+
+            char rc;
+            if (A) {
+                String currentVal = kvStore.get(key);
+                if (currentVal.equals(requestedValue)) {
+                    kvStore.put(key, newValue);
+                    rc = 'R';
+                } else {
+                    rc = 'N';
+                }
+            } else {
+                if (B) {
+                    if (key.startsWith("N:")) {
+                        maybeStoreAddress(key, newValue);
+                    } else {
+                        kvStore.put(key, newValue);
+                    }
+                    rc = 'A';
+                } else {
+                    rc = 'X';
+                }
+            }
+            String resp = txID + " D " + rc;
+            sendResponse(packet, resp);
+
+        } catch (IllegalArgumentException e) {
+            sendResponse(packet, txID + " D X");
+        }
+    }
+
+    private void handleNameRequest(String txID, DatagramPacket packet) throws IOException {
+        String response = txID + " H " + encodeString(nodeName);
+        sendResponse(packet, response);
+    }
+
+    private void handleNearestRequest(String txID, String payload, DatagramPacket packet) throws IOException {
+        String targetHash = payload.trim();
+
+        List<String> nodeKeys = new ArrayList<>();
+        for (String k : kvStore.keySet()) {
+            if (k.startsWith("N:")) {
+                nodeKeys.add(k);
+            }
+        }
+        nodeKeys.sort((a,b) -> {
+            int da = distance(computeHash(a), targetHash);
+            int db = distance(computeHash(b), targetHash);
+            return Integer.compare(da, db);
+        });
+
+        StringBuilder sb = new StringBuilder();
+        int limit = Math.min(3, nodeKeys.size());
+        for (int i = 0; i < limit; i++) {
+            String nodeK = nodeKeys.get(i);
+            String nodeV = kvStore.get(nodeK);
+            sb.append(encodeString(nodeK)).append(" ").append(encodeString(nodeV)).append(" ");
+        }
+        String response = txID + " O " + sb.toString();
+        sendResponse(packet, response);
+    }
+
+    private void handleRelayRequest(String txID, String payload, DatagramPacket packet) throws IOException {
+        try {
+            ParseResult pr1 = extractStringWithOffset(payload, 0);
+            String targetNode = pr1.value;
+
+            String embedded = payload.substring(pr1.nextOffset);
+
+            String addr = kvStore.get(targetNode);
+            if (addr == null) {
+                return;
+            }
+            String[] parts = addr.split(":");
+            InetAddress ip = InetAddress.getByName(parts[0]);
+            int port = Integer.parseInt(parts[1]);
+
+            byte[] data = embedded.getBytes(StandardCharsets.UTF_8);
+            DatagramPacket out = new DatagramPacket(data, data.length, ip, port);
+            socket.send(out);
+
+            byte[] buf = new byte[1500];
+            DatagramPacket resp = new DatagramPacket(buf, buf.length);
+            socket.receive(resp);
+            String respStr = new String(resp.getData(), 0, resp.getLength(), StandardCharsets.UTF_8);
+
+            if (respStr.length() >= 2) {
+                String forwarded = txID + respStr.substring(2);
+                sendResponse(packet, forwarded);
+            }
+
+        } catch (Exception e) {
+        }
+    }
+
+
+    @Override
+    public boolean isActive(String nodeName) throws Exception {
+        String addr = kvStore.get(nodeName);
+        if (addr == null) {
+            return false;
+        }
+        String txID = generateTxID();
+        String request = txID + " G";
+        String response = sendRequestAndWait(addr, request);
+        if (response == null) return false;
+        if (response.length() < 5) return false;
+        if (!response.substring(0,2).equals(txID)) return false;
+        if (response.charAt(3) != 'H') return false;
+        String gotName = decodeString(response.substring(5));
+        return nodeName.equals(gotName);
+    }
+
     @Override
     public void pushRelay(String nodeName) throws Exception {
+        if (!nodeName.startsWith("N:")) {
+            throw new IllegalArgumentException("Relay nodeName must start with N:");
+        }
+        if (!kvStore.containsKey(nodeName)) {
+            throw new IllegalArgumentException("Unknown node for relay: " + nodeName);
+        }
         relayStack.push(nodeName);
     }
 
@@ -224,132 +445,94 @@ public class Node implements NodeInterface {
         }
     }
 
-    /**
-     * Checks if there is an entry in the network for 'key'.
-     * The simplest approach: we attempt a Key Existence Request "E key"
-     * from the node(s) we think are the 3 closest.
-     */
     @Override
     public boolean exists(String key) throws Exception {
-        List<String> candidates = findClosestNodes(key, 3);
-
-        if (candidates.isEmpty()) {
-            return dataMap.containsKey(key);
+        if (kvStore.containsKey(key)) {
+            return true;
         }
-
-        for (String cand : candidates) {
-            if (cand.equals(myNodeName)) {
-                if (dataMap.containsKey(key)) return true;
-                continue;
-            }
-
-            Boolean remoteExists = sendExistenceRequest(cand, key);
-            if (remoteExists != null && remoteExists.booleanValue()) {
-                return true;
+        List<String> nearest = findClosestNodes(key);
+        for (String addr : nearest) {
+            String txID = generateTxID();
+            String req = txID + " E " + encodeString(key);
+            String resp = sendRequestAndWait(addr, req);
+            if (resp == null) continue;
+            if (resp.startsWith(txID) && resp.length() >= 5 && resp.charAt(3) == 'F') {
+                char c = resp.charAt(5);
+                if (c == 'Y') {
+                    return true;
+                }
             }
         }
         return false;
     }
 
-    /**
-     * Attempt to read the value from up to 3 closest nodes.
-     * If one says "Y <value>", we return that. If all say "N" or "?" we return null.
-     */
     @Override
     public String read(String key) throws Exception {
-        List<String> candidates = findClosestNodes(key, 3);
-
-        if (candidates.isEmpty()) {
-            return dataMap.getOrDefault(key, null);
+        if (kvStore.containsKey(key)) {
+            return kvStore.get(key);
         }
-
-        for (String cand : candidates) {
-            if (cand.equals(myNodeName)) {
-                if (dataMap.containsKey(key)) {
-                    return dataMap.get(key);
-                }
-            } else {
-                String val = sendReadRequest(cand, key);
-                if (val != null) {
-                    return val;
+        List<String> nearest = findClosestNodes(key);
+        for (String addr : nearest) {
+            String txID = generateTxID();
+            String req = txID + " R " + encodeString(key);
+            String resp = sendRequestAndWait(addr, req);
+            if (resp == null) continue;
+            if (resp.startsWith(txID) && resp.length() > 5 && resp.charAt(3) == 'S') {
+                char c = resp.charAt(5);
+                if (c == 'Y') {
+                    String valPart = resp.substring(10);
+                    return valPart;
                 }
             }
         }
-
         return null;
     }
 
-    /**
-     * We'll attempt to store (key,value) in the 3 closest nodes.
-     * Return true if at least one node accepted the write (i.e. responded with 'A' or 'R')
-     */
     @Override
     public boolean write(String key, String value) throws Exception {
-        List<String> candidates = findClosestNodes(key, 3);
-        if (candidates.isEmpty()) {
-            if (isAmongThreeClosest(key)) {
-                dataMap.put(key, value);
-                return true;
-            }
-            return false;
+        boolean success = false;
+        if (key.startsWith("N:")) {
+            maybeStoreAddress(key, value);
+        } else {
+            kvStore.put(key, value);
+            success = true;
         }
 
-        boolean success = false;
-        for (String cand : candidates) {
-            if (cand.equals(myNodeName)) {
-                if (dataMap.containsKey(key)) {
-
-                }
-                dataMap.put(key, value);
-                success = true;
-            } else {
-                Boolean ok = sendWriteRequest(cand, key, value);
-                if (ok != null && ok) {
+        List<String> nearest = findClosestNodes(key);
+        for (String addr : nearest) {
+            String txID = generateTxID();
+            String req = txID + " W " + encodeString(key) + " " + encodeString(value);
+            String resp = sendRequestAndWait(addr, req);
+            if (resp == null) continue;
+            if (resp.startsWith(txID) && resp.length() > 5 && resp.charAt(3) == 'X') {
+                char c = resp.charAt(5);
+                if (c == 'A' || c == 'R') {
                     success = true;
                 }
             }
         }
-
         return success;
     }
 
-     /**
-     * If key == currentValue, replace with newValue at the 3 closest nodes.
-     * Return true if at least one node performed the CAS successfully (R or A).
-     */
     @Override
     public boolean CAS(String key, String currentValue, String newValue) throws Exception {
-        List<String> candidates = findClosestNodes(key, 3);
-        if (candidates.isEmpty()) {
-            if (isAmongThreeClosest(key)) {
-                String existing = dataMap.get(key);
-                if ((existing != null) && existing.equals(currentValue)) {
-                    dataMap.put(key, newValue);
-                    return true;
-                } else if (existing == null) {
-                    dataMap.put(key, newValue);
-                    return true;
-                }
-            }
-            return false;
+        if (kvStore.containsKey(key) && kvStore.get(key).equals(currentValue)) {
+            kvStore.put(key, newValue);
+            return true;
         }
-
+        List<String> nearest = findClosestNodes(key);
         boolean success = false;
-        for (String cand : candidates) {
-            if (cand.equals(myNodeName)) {
-                String storedVal = dataMap.get(key);
-                if (storedVal != null) {
-                    if (storedVal.equals(currentValue)) {
-                        dataMap.put(key, newValue);
-                        success = true;
-                    }
-                } else {
-                    dataMap.put(key, newValue);
-                    success = true;
-                }
-            } else {
-                Boolean ok = sendCASRequest(cand, key, currentValue, newValue);
-                if (ok != null && ok) {
+        for (String addr : nearest) {
+            String txID = generateTxID();
+            String req = txID + " C "
+                    + encodeString(key) + " "
+                    + encodeString(currentValue) + " "
+                    + encodeString(newValue);
+            String resp = sendRequestAndWait(addr, req);
+            if (resp == null) continue;
+            if (resp.startsWith(txID) && resp.length() > 5 && resp.charAt(3) == 'D') {
+                char c = resp.charAt(5);
+                if (c == 'R' || c == 'A') {
                     success = true;
                 }
             }
@@ -357,594 +540,243 @@ public class Node implements NodeInterface {
         return success;
     }
 
-    /**
-     * Parse inbound message, then produce a response if required.
-     *
-     * The first 2 bytes are TID, then a space, then 1 char request type,
-     * then possibly space and other data.
-     */
-    private void processIncomingMessage(String message, InetAddress senderAddr, int senderPort) {
-        try {
-            if (message.length() < 4) {
-                return;
-            }
-            String tid = message.substring(0, 2);
-            if (message.charAt(2) != ' ') {
-                return;
-            }
-            char mtype = message.charAt(3);
-
-            String remainder = "";
-            if (message.length() > 4) {
-                remainder = message.substring(4).trim();
-            }
-
-            switch(mtype) {
-                case 'G':
-                    sendResponse(senderAddr, senderPort, tid + " H " + myNodeName);
-                    break;
-
-                case 'H':
-                    storeResponse(tid, "H " + remainder);
-                    break;
-
-                case 'N':
-                    processNearestRequest(tid, remainder, senderAddr, senderPort);
-                    break;
-
-                case 'O':
-                    storeResponse(tid, "O " + remainder);
-                    break;
-
-                case 'I':
-                    break;
-
-                case 'V':
-                    processRelayMessage(tid, remainder, senderAddr, senderPort);
-                    break;
-
-                case 'E':
-                    processKeyExistRequest(tid, remainder, senderAddr, senderPort);
-                    break;
-
-                case 'F':
-                    storeResponse(tid, "F " + remainder);
-                    break;
-
-                case 'R':
-                    processReadRequest(tid, remainder, senderAddr, senderPort);
-                    break;
-
-                case 'S':
-                    storeResponse(tid, "S " + remainder);
-                    break;
-
-                case 'W':
-                    processWriteRequest(tid, remainder, senderAddr, senderPort);
-                    break;
-
-                case 'X':
-                    storeResponse(tid, "X " + remainder);
-                    break;
-
-                case 'C':
-                    processCASRequest(tid, remainder, senderAddr, senderPort);
-                    break;
-
-                case 'D':
-                    storeResponse(tid, "D " + remainder);
-                    break;
-
-                default:
-                    break;
-            }
-
-        } catch (Exception e) {
-        }
-    }
-
-     private void processNearestRequest(String tid, String hashHex, InetAddress senderAddr, int senderPort) throws Exception {
-        byte[] targetHash = parseHex(hashHex);
-        List<String> best = findClosestNodesByHash(targetHash, 3);
-
-        StringBuilder sb = new StringBuilder();
-        for (String nodeName : best) {
-            String addr = addressMap.get(nodeName);
+    private List<String> findClosestNodes(String key) {
+        Set<String> visited = new HashSet<>();
+        PriorityQueue<NodeDistance> pq = new PriorityQueue<>(Comparator.comparingInt(nd -> nd.distance));
+        for (String k : kvStore.keySet()) {
+            if (!k.startsWith("N:")) continue;
+            String addr = kvStore.get(k);
             if (addr == null) continue;
-            int keySpaces = countSpaces(nodeName);
-            int valSpaces = countSpaces(addr);
-            sb.append(keySpaces).append(" ").append(nodeName).append(" ")
-                    .append(valSpaces).append(" ").append(addr).append(" ");
-        }
-        String response = tid + " O " + sb.toString();
-        sendResponse(senderAddr, senderPort, response);
-    }
-
-    /**
-     * remainder = "N:TargetNode <innerMessage>"
-     * We must forward <innerMessage> to TargetNode, then if it’s a request,
-     * we forward the response back to sender using TID of the *relay message*.
-     */
-    private void processRelayMessage(String tid, String remainder,
-                                     InetAddress senderAddr, int senderPort) throws Exception
-    {
-        int spaceIdx = remainder.indexOf(' ');
-        if (spaceIdx < 0) return;
-        String targetNode = remainder.substring(0, spaceIdx);
-        String innerMsg = remainder.substring(spaceIdx + 1);
-
-        String addr = addressMap.get(targetNode);
-        if (addr == null) {
-            return;
-        }
-        String[] parts = addr.split(":");
-        if (parts.length != 2) return;
-        InetAddress ip = InetAddress.getByName(parts[0]);
-        int port = Integer.parseInt(parts[1]);
-
-        String innerTID = innerMsg.substring(0, 2);
-        RelayInfo rinfo = new RelayInfo(tid, senderAddr, senderPort);
-        synchronized (relayPending) {
-            relayPending.put(innerTID, rinfo);
+            int d = distance(computeHash(k), computeHash(key));
+            pq.offer(new NodeDistance(addr, d));
         }
 
-        sendMessage(ip, port, innerMsg);
-    }
+        int expansions = 0;
+        while (!pq.isEmpty() && expansions < 100) {
+            NodeDistance nd = pq.poll();
+            if (visited.contains(nd.addr)) continue;
+            visited.add(nd.addr);
 
-    private Map<String, RelayInfo> relayPending = new HashMap<>();
-    private static class RelayInfo {
-        public String originalTID;
-        public InetAddress senderAddr;
-        public int senderPort;
-        public RelayInfo(String t, InetAddress a, int p) {
-            this.originalTID = t; this.senderAddr = a; this.senderPort = p;
-        }
-    }
-
-    private void storeResponse(String tid, String data) {
-        RelayInfo rinfo = null;
-        synchronized (relayPending) {
-            rinfo = relayPending.remove(tid);
-        }
-        if (rinfo != null) {
-            try {
-                String msg = rinfo.originalTID + " " + data;
-                sendResponse(rinfo.senderAddr, rinfo.senderPort, msg);
-                return;
-            } catch (Exception e) {
+            expansions++;
+            List<String> discovered = doNearestRequest(nd.addr, computeHash(key));
+            for (String newAddr : discovered) {
+                if (!visited.contains(newAddr)) {
+                    for (Map.Entry<String,String> e : kvStore.entrySet()) {
+                        if (e.getValue().equals(newAddr)) {
+                            String nodeK = e.getKey();
+                            int d2 = distance(computeHash(nodeK), computeHash(key));
+                            pq.offer(new NodeDistance(newAddr, d2));
+                        }
+                    }
+                }
             }
         }
 
-        synchronized (responseLock) {
-            responseMap.put(tid, data);
+        List<NodeDistance> all = new ArrayList<>();
+        for (String nodeK : kvStore.keySet()) {
+            if (!nodeK.startsWith("N:")) continue;
+            String nodeAddr = kvStore.get(nodeK);
+            int dist = distance(computeHash(nodeK), computeHash(key));
+            all.add(new NodeDistance(nodeAddr, dist));
         }
-    }
-
-    private void processKeyExistRequest(String tid, String key,
-                                        InetAddress senderAddr, int senderPort) throws Exception
-    {
-        boolean weHave = dataMap.containsKey(key);
-        boolean weAreClose = isAmongThreeClosest(key);
-
-        char resp;
-        if (weHave) {
-            resp = 'Y';
-        } else {
-            if (weAreClose) {
-                resp = 'N';
-            } else {
-                resp = '?';
-            }
-        }
-        String response = tid + " F " + resp;
-        sendResponse(senderAddr, senderPort, response);
-    }
-
-    private void processReadRequest(String tid, String key,
-                                    InetAddress senderAddr, int senderPort) throws Exception
-    {
-        boolean weHave = dataMap.containsKey(key);
-        boolean weAreClose = isAmongThreeClosest(key);
-
-        char respChar;
-        String val = "";
-        if (weHave) {
-            respChar = 'Y';
-            val = dataMap.get(key);
-        } else {
-            if (weAreClose) {
-                respChar = 'N';
-            } else {
-                respChar = '?';
-            }
-        }
-        int spaces = countSpaces(val);
-        String response = tid + " S " + respChar + " " +
-                ((respChar=='Y')? (spaces + " " + val + " ") : "0  ");
-        sendResponse(senderAddr, senderPort, response);
-    }
-
-    private void processWriteRequest(String tid, String remainder,
-                                     InetAddress senderAddr, int senderPort) throws Exception
-    {
-        String[] parts = remainder.split(" ", 4);
-        if (parts.length < 4) {
-            return;
-        }
-        String key = parts[1];
-        String value = parts[3];
-
-        boolean weHave = dataMap.containsKey(key);
-        boolean weAreClose = isAmongThreeClosest(key);
-
-        char respChar;
-        if (weHave) {
-            dataMap.put(key, value);
-            respChar = 'R';
-        } else {
-            if (weAreClose) {
-                dataMap.put(key, value);
-                respChar = 'A';
-            } else {
-                respChar = 'X';
-            }
-        }
-
-        String response = tid + " X " + respChar;
-        sendResponse(senderAddr, senderPort, response);
-    }
-
-    private void processCASRequest(String tid, String remainder,
-                                   InetAddress senderAddr, int senderPort) throws Exception
-    {
-        String[] parts = remainder.split(" ", 5);
-        if (parts.length < 5) {
-            return;
-        }
-
-        String key = parts[1];
-        String p2 = parts[4];
-
-        String[] sub = p2.split(" ", 2);
-        if (sub.length < 2) {
-            return;
-        }
-        String newVal = sub[1];
-        String requestedVal = parts[3];
-
-        boolean weHave = dataMap.containsKey(key);
-        boolean weAreClose = isAmongThreeClosest(key);
-        char respChar;
-        if (weHave) {
-            String existing = dataMap.get(key);
-            if ((existing != null) && existing.equals(requestedVal)) {
-                dataMap.put(key, newVal);
-                respChar = 'R';
-            } else {
-                respChar = 'N';
-            }
-        } else {
-            if (weAreClose) {
-                dataMap.put(key, newVal);
-                respChar = 'A';
-            } else {
-                respChar = 'X';
-            }
-        }
-
-        String response = tid + " D " + respChar;
-        sendResponse(senderAddr, senderPort, response);
-    }
-
-    private void sendMessage(InetAddress ip, int port, String payload) throws IOException {
-        byte[] buf = payload.getBytes("UTF-8");
-        DatagramPacket packet = new DatagramPacket(buf, buf.length, ip, port);
-        socket.send(packet);
-    }
-
-    private void sendResponse(InetAddress ip, int port, String response) throws IOException {
-        sendMessage(ip, port, response);
-    }
-
-    private String generateTID() {
-        byte b1 = (byte)(32 + random.nextInt(95));
-        byte b2 = (byte)(32 + random.nextInt(95));
-        if (b1 == 0x20) b1 = 0x21;
-        if (b2 == 0x20) b2 = 0x21;
-        return new String(new byte[]{b1, b2});
-    }
-
-    /**
-     * If our relay stack is non-empty, we must wrap the message inside
-     * V <topRelayNode> <msg>, and if more relays exist, that message
-     * itself is wrapped, etc.
-     */
-    private String wrapWithRelay(String tid, String finalTarget, String rawMessage) {
-        if (relayStack.isEmpty()) {
-            return rawMessage;
-        }
-
-        List<String> relays = new ArrayList<>(relayStack);
-        String top = relays.get(relays.size() - 1);
-        return tid + " V " + top + " " + rawMessage;
-    }
-
-    private byte[] parseHex(String hex) throws Exception {
-        if (hex.length() != 64) {
-            throw new Exception("Not a 64-hex-digit string");
-        }
-        byte[] result = new byte[32];
-        for (int i = 0; i < 32; i++) {
-            int hi = Character.digit(hex.charAt(2*i), 16);
-            int lo = Character.digit(hex.charAt(2*i+1), 16);
-            if (hi<0 || lo<0) throw new Exception("Bad hex");
-            result[i] = (byte)((hi<<4) + lo);
+        all.sort(Comparator.comparingInt(x-> x.distance));
+        List<String> result = new ArrayList<>();
+        for (int i = 0; i < Math.min(3, all.size()); i++) {
+            result.add(all.get(i).addr);
         }
         return result;
     }
 
-    private byte[] sha256(String s) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        return md.digest(s.getBytes("UTF-8"));
+    private List<String> doNearestRequest(String addr, String hash) {
+        List<String> discovered = new ArrayList<>();
+        String txID = generateTxID();
+        String req = txID + " N " + hash;
+        String resp = sendRequestAndWait(addr, req);
+        if (resp == null) {
+            return discovered;
+        }
+        if (resp.startsWith(txID) && resp.length() >= 5 && resp.charAt(3) == 'O') {
+            String part = resp.substring(5);
+            int offset = 0;
+            while (offset < part.length()) {
+                try {
+                    ParseResult r1 = extractStringWithOffset(part, offset);
+                    String discoveredKey = r1.value;
+                    offset = r1.nextOffset;
+                    ParseResult r2 = extractStringWithOffset(part, offset);
+                    String discoveredVal = r2.value;
+                    offset = r2.nextOffset;
+
+                    if (discoveredKey.startsWith("N:")) {
+                        maybeStoreAddress(discoveredKey, discoveredVal);
+                        discovered.add(discoveredVal);
+                    }
+                } catch (Exception e) {
+                    break;
+                }
+            }
+        }
+        return discovered;
     }
 
-    /**
-     * Distance = 256 - (count of leading bits that match).
-     */
-    private int distance(byte[] h1, byte[] h2) {
-        int count = 0;
-        for (int i = 0; i < 32; i++) {
-            if (h1[i] == h2[i]) {
-                count += 8;
+    private String sendRequestAndWait(String addr, String message) {
+        if (addr == null) return null;
+        try {
+            String[] parts = addr.split(":");
+            InetAddress ip = InetAddress.getByName(parts[0]);
+            int port = Integer.parseInt(parts[1]);
+
+            String finalMessage = message;
+            for (String relayNode : relayStack) {
+                finalMessage = generateTxID() + " V " + encodeString(relayNode) + " " + finalMessage;
+            }
+
+            for (int attempt = 0; attempt < 3; attempt++) {
+                byte[] data = finalMessage.getBytes(StandardCharsets.UTF_8);
+                DatagramPacket dp = new DatagramPacket(data, data.length, ip, port);
+                socket.send(dp);
+
+                long giveUp = System.currentTimeMillis() + 2000;
+                while (System.currentTimeMillis() < giveUp) {
+                    try {
+                        byte[] buf = new byte[1500];
+                        DatagramPacket rec = new DatagramPacket(buf, buf.length);
+                        socket.receive(rec);
+                        String recStr = new String(rec.getData(), 0, rec.getLength(), StandardCharsets.UTF_8);
+
+                        if (recStr.length() >= 2
+                                && recStr.substring(0,2).equals(message.substring(0,2))) {
+                            //System.out.println("sendRequestAndWait: got='" + recStr + "'");
+                            return recStr;
+                        }
+                    }
+                    catch (SocketTimeoutException ste) {
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+        }
+        return null;
+    }
+
+    private void sendResponse(DatagramPacket requestPacket, String response) throws IOException {
+        byte[] data = response.getBytes(StandardCharsets.UTF_8);
+        DatagramPacket resp = new DatagramPacket(data, data.length,
+                requestPacket.getAddress(), requestPacket.getPort());
+        socket.send(resp);
+    }
+
+    private String computeHash(String s) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(s.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        }
+        catch (NoSuchAlgorithmException e) {
+            return "";
+        }
+    }
+
+    private int distance(String hashA, String hashB) {
+        int matchedBits = 0;
+        for (int i = 0; i < 64; i++) {
+            char cA = hashA.charAt(i);
+            char cB = hashB.charAt(i);
+            if (cA == cB) {
+                matchedBits += 4;
             } else {
-                int xor = (h1[i] ^ h2[i]) & 0xFF;
-                int bitPos = Integer.numberOfLeadingZeros(xor) - 24;
-                count += bitPos;
+                int nibbleA = Character.digit(cA, 16);
+                int nibbleB = Character.digit(cB, 16);
+                int xor = nibbleA ^ nibbleB;
+                for (int b = 3; b >= 0; b--) {
+                    int mask = 1 << b;
+                    if ((xor & mask) == 0) {
+                        matchedBits++;
+                    } else {
+                        break;
+                    }
+                }
                 break;
             }
         }
-        return 256 - count;
+        return 256 - matchedBits;
     }
 
-    /**
-     * Return up to 'maxCount' known nodeNames that are (by our current knowledge)
-     * closest to 'key'.
-     * We also include ourselves in the set if we have an address for ourselves
-     * (which we do).
-     */
-    private List<String> findClosestNodes(String key, int maxCount) throws Exception {
-        byte[] keyHash = sha256(key);
-        TreeMap<Integer, List<String>> distMap = new TreeMap<>();
-        int dMe = distance(myNodeHashID, keyHash);
-        distMap.computeIfAbsent(dMe, k->new ArrayList<>()).add(myNodeName);
+    private String generateTxID() {
+        Random r = new Random();
+        char c1 = (char)('A' + r.nextInt(26));
+        char c2 = (char)('A' + r.nextInt(26));
+        return "" + c1 + c2;
+    }
 
-        for (String nodeName : addressMap.keySet()) {
-            if (!nodeName.startsWith("N:")) continue;
-            byte[] hN = sha256(nodeName);
-            int d = distance(hN, keyHash);
-            distMap.computeIfAbsent(d, k->new ArrayList<>()).add(nodeName);
+    private static class ParseResult {
+        String value;
+        int nextOffset;
+        ParseResult(String v, int n) {
+            value = v; nextOffset = n;
         }
-        List<String> result = new ArrayList<>();
-        for (Map.Entry<Integer, List<String>> e : distMap.entrySet()) {
-            for (String nm : e.getValue()) {
-                result.add(nm);
-                if (result.size() >= maxCount) {
-                    return result;
-                }
+    }
+
+    private ParseResult extractStringWithOffset(String payload, int offset) {
+        int spaceCountEnd = payload.indexOf(' ', offset);
+        if (spaceCountEnd == -1) {
+            throw new IllegalArgumentException("No space after space-count digits in CRN string");
+        }
+        int spaceCount;
+        try {
+            spaceCount = Integer.parseInt(payload.substring(offset, spaceCountEnd));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("spaceCount not an integer");
+        }
+        int stringStart = spaceCountEnd + 1;
+        int stringEnd = payload.indexOf(' ', stringStart);
+        if (stringEnd == -1) {
+            throw new IllegalArgumentException("No trailing space after CRN string");
+        }
+        String extracted = payload.substring(stringStart, stringEnd);
+
+        int actualSpaces = 0;
+        for (char c : extracted.toCharArray()) {
+            if (c == ' ') actualSpaces++;
+        }
+        if (actualSpaces != spaceCount) {
+            throw new IllegalArgumentException("CRN string spaceCount mismatch");
+        }
+        return new ParseResult(extracted, stringEnd + 1);
+    }
+
+    private String encodeString(String s) {
+        if (s == null) {
+            s = "";
+        }
+        int numSpaces = 0;
+        for (char c : s.toCharArray()) {
+            if (c == ' ') {
+                numSpaces++;
             }
         }
-        return result;
+        return numSpaces + " " + s + " ";
     }
 
-    private List<String> findClosestNodesByHash(byte[] targetHash, int maxCount) throws Exception {
-        TreeMap<Integer, List<String>> distMap = new TreeMap<>();
-        int dMe = distance(myNodeHashID, targetHash);
-        distMap.computeIfAbsent(dMe, k->new ArrayList<>()).add(myNodeName);
-
-        for (String nodeName : addressMap.keySet()) {
-            if (!nodeName.startsWith("N:")) continue;
-            byte[] hN = sha256(nodeName);
-            int d = distance(hN, targetHash);
-            distMap.computeIfAbsent(d, k->new ArrayList<>()).add(nodeName);
-        }
-        List<String> result = new ArrayList<>();
-        for (Map.Entry<Integer, List<String>> e : distMap.entrySet()) {
-            for (String nm : e.getValue()) {
-                result.add(nm);
-                if (result.size() >= maxCount) {
-                    return result;
-                }
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Check if *this node* is among the 3 closest to the given key
-     * (based on what we currently know).
-     */
-    private boolean isAmongThreeClosest(String key) throws Exception {
-        List<String> c = findClosestNodes(key, 3);
-        for (String s : c) {
-            if (s.equals(myNodeName)) return true;
-        }
-        return false;
-    }
-
-    /**
-     * If we have fewer than 3 addresses at a certain distance, we add it.
-     * If we have 3, we might prefer to keep older or remove them.
-     * (Below we do a simplistic approach that always keeps the earliest 3.)
-     */
-    private void storeAddressKeyValue(String nodeName, String address) throws Exception {
-        addressMap.put(nodeName, address);
-
-        byte[] nodeHash = sha256(nodeName);
-        int dist = distance(myNodeHashID, nodeHash);
-        List<String> bucket = distanceBuckets.get(dist);
-        if (bucket == null) {
-            bucket = new ArrayList<>();
-            distanceBuckets.put(dist, bucket);
-        }
-        if (!bucket.contains(nodeName)) {
-            if (bucket.size() < 3) {
-                bucket.add(nodeName);
-            } else {
-            }
+    private String decodeString(String chunk) {
+        try {
+            ParseResult r= extractStringWithOffset(chunk,0);
+            return r.value;
+        } catch(Exception e){
+            return "";
         }
     }
 
-    private int countSpaces(String s) {
-        int c=0;
-        for (int i=0; i<s.length(); i++) {
-            if (s.charAt(i)==' ') c++;
+    private static class NodeDistance {
+        String addr;
+        int distance;
+        NodeDistance(String a, int d) {
+            addr = a; distance = d;
         }
-        return c;
     }
-
-    private Boolean sendExistenceRequest(String nodeName, String key) throws Exception {
-        String addr = addressMap.get(nodeName);
-        if (addr == null) return null;
-
-        String[] parts = addr.split(":");
-        InetAddress ip = InetAddress.getByName(parts[0]);
-        int port = Integer.parseInt(parts[1]);
-
-        int keySpaces = countSpaces(key);
-        String tid = generateTID();
-        String msg = tid + " E " + keySpaces + " " + key + " ";
-
-        for (int attempt=0; attempt<3; attempt++) {
-            sendMessage(ip, port, wrapWithRelay(tid, nodeName, msg));
-
-            long start = System.currentTimeMillis();
-            while(System.currentTimeMillis() - start < 1000) {
-                handleIncomingMessages(50);
-                String response = null;
-                synchronized(responseLock) {
-                    response = responseMap.remove(tid);
-                }
-                if (response != null) {
-                    if (!response.startsWith("F ")) return null;
-                    char c = response.charAt(2);
-                    if (c=='Y') return true;
-                    if (c=='N') return false;
-                    if (c=='?') return false;
-                    return false;
-                }
-            }
-        }
-        return null;
-    }
-
-    private String sendReadRequest(String nodeName, String key) throws Exception {
-        String addr = addressMap.get(nodeName);
-        if (addr == null) return null;
-
-        String[] parts = addr.split(":");
-        InetAddress ip = InetAddress.getByName(parts[0]);
-        int port = Integer.parseInt(parts[1]);
-
-        int ks = countSpaces(key);
-        String tid = generateTID();
-        String msg = tid + " R " + ks + " " + key + " ";
-        for(int attempt=0; attempt<3; attempt++){
-            sendMessage(ip, port, wrapWithRelay(tid, nodeName, msg));
-            long start = System.currentTimeMillis();
-            while(System.currentTimeMillis() - start < 1000) {
-                handleIncomingMessages(50);
-                String resp = null;
-                synchronized(responseLock) {
-                    resp = responseMap.remove(tid);
-                }
-                if (resp != null) {
-                    if (!resp.startsWith("S ")) return null;
-                    char c = resp.charAt(2);
-                    if (c=='Y') {
-                        String tail = resp.substring(3).trim();
-                        int spaceIndex = tail.indexOf(' ');
-                        if (spaceIndex < 0) return "";
-                        String val = tail.substring(spaceIndex+1).trim();
-                        return val;
-                    } else {
-                        return null;
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    private Boolean sendWriteRequest(String nodeName, String key, String value) throws Exception {
-        String addr = addressMap.get(nodeName);
-        if (addr == null) return null;
-        String[] parts = addr.split(":");
-        InetAddress ip = InetAddress.getByName(parts[0]);
-        int port = Integer.parseInt(parts[1]);
-
-        int ks = countSpaces(key);
-        int vs = countSpaces(value);
-        String tid = generateTID();
-        String msg = tid + " W " + ks + " " + key + " " + vs + " " + value + " ";
-
-        for(int attempt=0; attempt<3; attempt++){
-            sendMessage(ip, port, wrapWithRelay(tid, nodeName, msg));
-            long start = System.currentTimeMillis();
-            while(System.currentTimeMillis() - start < 1000) {
-                handleIncomingMessages(50);
-                String resp = null;
-                synchronized(responseLock) {
-                    resp = responseMap.remove(tid);
-                }
-                if (resp != null) {
-                    // "X respChar"
-                    if (!resp.startsWith("X ")) return null;
-                    char c = resp.charAt(2);
-                    if (c=='A' || c=='R') {
-                        return true;
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    private Boolean sendCASRequest(String nodeName, String key, String currentVal, String newVal) throws Exception {
-        String addr = addressMap.get(nodeName);
-        if (addr == null) return null;
-        String[] parts = addr.split(":");
-        InetAddress ip = InetAddress.getByName(parts[0]);
-        int port = Integer.parseInt(parts[1]);
-
-        int ks = countSpaces(key);
-        int cvs = countSpaces(currentVal);
-        int nvs = countSpaces(newVal);
-
-        String tid = generateTID();
-        String msg = tid + " C " + ks + " " + key + " "
-                + cvs + " " + currentVal + " "
-                + nvs + " " + newVal + " ";
-
-        for(int attempt=0; attempt<3; attempt++){
-            sendMessage(ip, port, wrapWithRelay(tid, nodeName, msg));
-            long start = System.currentTimeMillis();
-            while(System.currentTimeMillis() - start < 1000) {
-                handleIncomingMessages(50);
-                String resp = null;
-                synchronized(responseLock) {
-                    resp = responseMap.remove(tid);
-                }
-                if (resp != null) {
-                    if (!resp.startsWith("D ")) return null;
-                    char c = resp.charAt(2);
-                    if (c=='R' || c=='A') return true;
-                    if (c=='N' || c=='X') return false;
-                }
-            }
-        }
-        return null;
-    }
-
 }
