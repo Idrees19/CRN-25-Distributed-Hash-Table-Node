@@ -1,47 +1,93 @@
-# Build Instructions
+**CRN-25 Distributed Hash Table Node**
 
-1. Download or clone the repository that contains:
-   - `Node.java` (your main CRN node implementation)
-   - This `README.md`
+A Java implementation of a node in the CRN-25 peer-to-peer network protocol, built for the IN2011 Computer Networks coursework. Each node stores key/value pairs and cooperates with other nodes over UDP to route reads, writes, and compare-and-swap operations to whichever node(s) are "closest" to a given key, using SHA-256-based XOR distance (similar in spirit to Kademlia).
 
-2. Compile:
-   - Open a terminal inside the project folder.
-   - Compile all `.java` files:
+This implements the Node side of the protocol against a fixed interface (NodeInterface) and message format defined by the coursework specification. LocalTest.java and AzureLabTest.java are the test harnesses provided with the assignment.
 
-```bash
+**Features**
+
+Full CRN-25 message handling — recognises and responds to all message types: W (write), R (read), E (exists), C (compare-and-swap), G (get name), N (nearest), V (relay), and I (idle/ping).
+
+Ownership logic (Condition A/B) — determines whether a node already holds a key locally, or is among the 3 nodes closest to it, before deciding how to respond to read/write/exists/CAS requests.
+
+Bounded address storage — keeps at most 3 known node addresses per distance bucket.
+
+Iterative closest-node lookup — performs a breadth-first search across known peers to discover the actual nodes closest to a given key.
+
+Automatic resending — retries each outbound request up to 3 times if no response arrives within the timeout, per the protocol's resend requirement.
+
+Relaying — supports pushing/popping a stack of relay nodes so messages can be routed through intermediaries.
+
+Local and remote reads/writes — reads/writes data held locally, or forwards to the appropriate remote node(s) when it isn't the right owner.
+
+**Project Structure**
+
+.
+├── Node.java           # Core node implementation (NodeInterface)
+├── HashID.java          # SHA-256 hash helper
+├── LocalTest.java        # Spins up multiple nodes in-process and exercises read/write
+└── AzureLabTest.java      # Single-node test harness for the Azure virtual lab
+
+**Prerequisites**
+
+Java 11+
+
+For AzureLabTest: access to the Azure virtual lab network (this test will not work from a personal machine, since it depends on reaching lab-hosted nodes)
+
+**Build Instructions**
+
+Download or clone the repository, which should contain Node.java, HashID.java, LocalTest.java, and AzureLabTest.java.
+Open a terminal in the project folder and compile everything:
+
 javac *.java
-```
 
-   - This will generate the `.class` files for each of your Java classes.
+This generates a .class file for each class.
 
-3. Run:
-   - To test locally with the `LocalTest` class (if provided), do:
+**Running the Tests**
 
-```bash
+**Local test** (runs entirely on your own machine)
+
+Spins up multiple in-process nodes, bootstraps them with each other's addresses, then writes and reads back several key/value pairs to confirm the network is functioning:
+
 java LocalTest
-```
-     
-   - If you have a separate test program (like `AzureLabTest.java`), run it similarly but on a VM:
 
-```bash
+Optionally specify the number of nodes (2–10):
+
+java LocalTest 5
+
+
+**Azure lab test** (must be run on the virtual lab machines)
+
+Starts a single node, waits to be contacted by others on the lab network, reads a known set of key/value pairs, writes a marker value, and then advertises itself to the network:
+
 java AzureLabTest
-```
 
+Before running, set your own email address and the Azure lab machine's IP in AzureLabTest.java (search for the placeholder strings).
 
-## Working Functionality
+**Protocol Overview**
 
-- **Message Parsing and Handling:** All CRN message types (W, R, E, C, G, N, V, and I) are recognised.
+Nodes communicate over UDP using short text-based messages, each starting with a 2-character transaction ID. Strings within a message are length-prefixed by the count of embedded spaces, so parsers can locate string boundaries reliably even when the string itself contains spaces.
 
-- **Condition A/B Logic:** We correctly check whether we already store a key (A) and whether we are among the 3 closest nodes to the key (B) for read, write, exists, and CAS requests.
+Node/key "distance" is computed as 256 - (matching leading bits between two SHA-256 hashes) — the closer two hashes are, the smaller the distance.
 
-- **Storing Up to 3 Addresses per Distance:** The code enforces a maximum of three address entries for each distance.
+**Known Limitations / Notes**
 
-- **Iterative Nearest-Node Lookups:** For read/write/exists/CAS, we do a BFS to discover actual closest nodes.
+Message parsing assumes well-formed input. Malformed messages generally result in silently dropped or ?/X responses rather than detailed error reporting.
 
-- **Resending Requests:** Each request is sent up to 3 times if no response is received within a few seconds, matching the CRN “MUST resend” requirement.
+HashID.java is currently unused — Node.java computes its own SHA-256 hash inline rather than calling HashID.computeHashID. Consider consolidating to one hashing implementation.
 
-- **Reading/Writing:** We can read data that we store locally or data from remote nodes, assuming we discover the correct nearest node(s).
+Fixed 3-node closeness threshold is hardcoded in a few places (Condition B, address storage, nearest-node responses) rather than being a named constant.
 
-- **CAS:** The compare-and-swap implementation checks existing values and replaces them atomically if they match.
+No authentication/encryption — as per the base protocol, messages are plain UDP text, so this is only suitable for a trusted lab network, not the open internet.
 
-If run against the provided `LocalTest` and `AzureLabTest` (or any typical CRN test harness), the `Node` implementation should successfully store and retrieve data, handle address keys, and pass the major f[...]
+**Working Functionality Summary**
+
+Message parsing and handling for all CRN message types (W, R, E, C, G, N, V, I)
+Condition A/B logic for read, write, exists, and CAS requests
+Enforced maximum of 3 stored addresses per distance
+Iterative nearest-node lookups via BFS
+Automatic resending of unacknowledged requests (up to 3 attempts)
+Local and remote read/write
+Atomic compare-and-swap
+
+When run against LocalTest and AzureLabTest, the node successfully stores and retrieves data, handles address/key records, and passes the core functionality tests.
